@@ -22,7 +22,9 @@ def _vals_per_word(bits: int) -> int:
         return 10
     if bits == 4:
         return 8
-    raise ValueError(f"Unsupported bits: {bits}. Use 1, 2, 3, or 4.")
+    if bits == 5:
+        return 6  # 30 bits used, 2 wasted (same as 3-bit)
+    raise ValueError(f"Unsupported bits: {bits}. Use 1, 2, 3, 4, or 5.")
 
 
 def pack_indices(indices: mx.array, bits: int) -> mx.array:
