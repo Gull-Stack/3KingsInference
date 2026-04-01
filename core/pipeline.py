@@ -105,6 +105,8 @@ class ThreeKingsPipeline:
                 hidden_dim=self.config.model.hidden_dim,
                 expert_intermediate=self.config.model.expert_intermediate,
                 bits=self.config.expert_bits,
+                layer_offset=self.config.local_layer_start,
+                n_local_layers=self.config.local_layer_end - self.config.local_layer_start,
             )
             self.expert_loader = ExpertLoader(expert_config)
             try:
