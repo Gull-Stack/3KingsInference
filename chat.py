@@ -33,6 +33,8 @@ def main():
     parser.add_argument("--value-bits", type=int, default=5, help="KV cache value bits")
     parser.add_argument("--no-compression", action="store_true", help="Disable KV compression")
     parser.add_argument("--system", type=str, default=None, help="System prompt")
+    parser.add_argument("--worker", action="store_true",
+                        help="Run as worker node — no interactive chat, just process activations")
     args = parser.parse_args()
 
     # Build config
@@ -57,6 +59,18 @@ def main():
     # Setup pipeline
     pipeline = ThreeKingsPipeline(config)
     pipeline.setup(args.model)
+
+    # Worker mode: stay alive processing activations from peer
+    if args.worker:
+        print("3Kings Worker — processing activations from peer (Ctrl+C to quit)\n")
+        try:
+            import signal
+            signal.pause()
+        except KeyboardInterrupt:
+            print("\nWorker shutting down.")
+        finally:
+            pipeline.teardown()
+        return
 
     # Chat loop
     print("3Kings Chat — type 'quit' to exit, 'stats' for performance info\n")
