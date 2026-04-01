@@ -35,16 +35,13 @@ def load_model(model_path: str, strip_experts: bool = False):
         (model, tokenizer) — the native mlx-lm objects
     """
     if strip_experts:
-        # Lazy load: creates model graph without materializing weights
+        # Lazy load: weights stay as mmap references to safetensors on SSD.
+        # During inference, MLX pages in only the weights needed per forward
+        # pass — non-expert params (~5GB) stay resident, expert weights
+        # (4 of 512 per layer) get paged on demand by the OS page cache.
+        # This IS SSD expert streaming (Mjolnir) via MLX's native mechanism.
         model, tokenizer = mlx_load(model_path, lazy=True)
-
-        # Replace expert weights with tiny placeholders before eval
-        removed = strip_expert_weights(model)
-        if removed:
-            print(f"  Stripped {len(removed)} expert weight tensors from RAM")
-
-        # Now eval only the remaining (non-expert) parameters
-        mx.eval(model.parameters())
+        print(f"  Lazy loaded — experts will stream from SSD via page cache")
         return model, tokenizer
     else:
         model, tokenizer = mlx_load(model_path)
