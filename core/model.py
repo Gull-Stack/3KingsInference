@@ -22,14 +22,33 @@ from mlx_lm import load as mlx_load
 from compression.kv_cache import CompressedKVCache
 
 
-def load_model(model_path: str):
+def load_model(model_path: str, strip_experts: bool = False):
     """Load model and tokenizer via mlx-lm.
+
+    Args:
+        model_path: Path to the model directory or HF repo
+        strip_experts: If True, load lazily, strip expert weights from RAM,
+            then eval only non-expert params. This reduces memory from ~209GB
+            to ~5.5GB for MoE models — experts are streamed from SSD via Mjolnir.
 
     Returns:
         (model, tokenizer) — the native mlx-lm objects
     """
-    model, tokenizer = mlx_load(model_path)
-    return model, tokenizer
+    if strip_experts:
+        # Lazy load: creates model graph without materializing weights
+        model, tokenizer = mlx_load(model_path, lazy=True)
+
+        # Replace expert weights with tiny placeholders before eval
+        removed = strip_expert_weights(model)
+        if removed:
+            print(f"  Stripped {len(removed)} expert weight tensors from RAM")
+
+        # Now eval only the remaining (non-expert) parameters
+        mx.eval(model.parameters())
+        return model, tokenizer
+    else:
+        model, tokenizer = mlx_load(model_path)
+        return model, tokenizer
 
 
 def get_model_info(model) -> dict:

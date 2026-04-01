@@ -33,14 +33,21 @@ import mlx.core as mx
 import numpy as np
 
 
-def get_expert_keys(layer_idx: int) -> dict[str, str]:
-    """Get the safetensors key patterns for expert weights in a layer."""
-    prefix = f"model.layers.{layer_idx}.mlp.switch_mlp"
-    return {
-        "gate_proj": f"{prefix}.gate_proj.weight",
-        "up_proj": f"{prefix}.up_proj.weight",
-        "down_proj": f"{prefix}.down_proj.weight",
-    }
+def get_expert_keys(layer_idx: int) -> dict[str, list[str]]:
+    """Get the safetensors key patterns for expert weights in a layer.
+
+    Qwen3.5 MLX quantized format stores each projection as three tensors:
+      .weight (uint32 packed), .scales (bfloat16), .biases (bfloat16)
+    """
+    prefix = f"language_model.model.layers.{layer_idx}.mlp.switch_mlp"
+    keys = {}
+    for proj in ("gate_proj", "up_proj", "down_proj"):
+        keys[proj] = [
+            f"{prefix}.{proj}.weight",
+            f"{prefix}.{proj}.scales",
+            f"{prefix}.{proj}.biases",
+        ]
+    return keys
 
 
 def find_weight_file_for_key(weight_files: list[str], key: str) -> str | None:
@@ -113,56 +120,78 @@ def split_experts(
     total_bytes = 0
     t_start = time.time()
 
+    # Cache of loaded safetensor files to avoid reloading
+    loaded_files: dict[str, dict] = {}
+
+    def load_safetensors(filepath: str) -> dict:
+        if filepath not in loaded_files:
+            # Only keep 2 files cached to limit memory
+            if len(loaded_files) >= 2:
+                oldest = next(iter(loaded_files))
+                del loaded_files[oldest]
+            loaded_files[filepath] = mx.load(filepath)
+        return loaded_files[filepath]
+
     for layer_idx in range(layer_start, layer_end):
         keys = get_expert_keys(layer_idx)
         layer_file = output_path / f"layer_{layer_idx:02d}.bin"
 
         print(f"  Layer {layer_idx:2d}: ", end="", flush=True)
 
-        # Load expert weight tensors
-        expert_weights = {}
-        for proj_name, key in keys.items():
-            # Find the right file
-            if weight_map and key in weight_map:
-                source_file = str(model_path / weight_map[key])
-            else:
-                source_file = find_weight_file_for_key(weight_files, key)
+        # Load all tensors for this layer's experts (weight + scales + biases per proj)
+        expert_tensors: dict[str, dict[str, mx.array]] = {}
+        skip = False
 
-            if source_file is None:
-                print(f"SKIP (key {key} not found)")
+        for proj_name, key_list in keys.items():
+            expert_tensors[proj_name] = {}
+            for key in key_list:
+                # Determine tensor type from key suffix
+                tensor_type = key.rsplit(".", 1)[-1]  # "weight", "scales", or "biases"
+
+                # Find the right source file
+                source_file = None
+                if weight_map and key in weight_map:
+                    source_file = str(model_path / weight_map[key])
+                else:
+                    source_file = find_weight_file_for_key(weight_files, key)
+
+                if source_file is None:
+                    print(f"SKIP (key {key} not found)")
+                    skip = True
+                    break
+
+                weights = load_safetensors(source_file)
+                if key not in weights:
+                    print(f"SKIP (key {key} missing from {source_file})")
+                    skip = True
+                    break
+
+                expert_tensors[proj_name][tensor_type] = weights[key]
+
+            if skip:
                 break
 
-            weights = mx.load(source_file)
-            if key not in weights:
-                print(f"SKIP (key {key} missing from {source_file})")
-                break
-
-            expert_weights[proj_name] = weights[key]
-
-        if len(expert_weights) != 3:
+        if skip or len(expert_tensors) != 3:
             continue
 
-        # Verify shapes
-        gate = expert_weights["gate_proj"]   # (num_experts, intermediate, hidden)
-        up = expert_weights["up_proj"]       # (num_experts, intermediate, hidden)
-        down = expert_weights["down_proj"]   # (num_experts, hidden, intermediate)
-
-        actual_experts = gate.shape[0]
+        # Get expert count from first tensor
+        actual_experts = expert_tensors["gate_proj"]["weight"].shape[0]
         if actual_experts != num_experts:
             print(f"WARN: expected {num_experts} experts, got {actual_experts}")
 
         # Write per-layer binary file
-        # Each expert: [gate_proj_bytes | up_proj_bytes | down_proj_bytes]
+        # Each expert: [gate_weight|gate_scales|gate_biases|up_weight|up_scales|up_biases|down_weight|down_scales|down_biases]
         with open(layer_file, "wb") as f:
             for eidx in range(actual_experts):
-                # Extract single expert weights and flatten
-                gate_e = np.array(gate[eidx]).flatten()
-                up_e = np.array(up[eidx]).flatten()
-                down_e = np.array(down[eidx]).flatten()
-
-                # Write as raw bytes (preserving original dtype)
-                expert_bytes = gate_e.tobytes() + up_e.tobytes() + down_e.tobytes()
-                f.write(expert_bytes)
+                for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                    for tensor_type in ("weight", "scales", "biases"):
+                        tensor = expert_tensors[proj_name][tensor_type]
+                        expert_slice = tensor[eidx].flatten()
+                        # Convert to numpy-compatible dtype before writing
+                        if expert_slice.dtype == mx.bfloat16:
+                            expert_slice = expert_slice.astype(mx.float16)
+                        raw = np.array(expert_slice, copy=False).tobytes()
+                        f.write(raw)
 
         file_size = os.path.getsize(layer_file)
         expert_size = file_size // actual_experts

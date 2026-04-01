@@ -10,6 +10,7 @@ architecture) and patches in our three kings:
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import mlx.core as mx
@@ -64,8 +65,10 @@ class ThreeKingsPipeline:
         print(f"3Kings: Setting up on machine {self.config.machine_id}...")
 
         # Load model and tokenizer via mlx-lm (handles all quantization)
-        print(f"  Loading model from {model_path}...")
-        self.model, self.tokenizer = load_model(model_path)
+        # Strip expert weights when expert_dir exists — Mjolnir streams them from SSD
+        has_expert_files = Path(self.config.expert_dir).exists()
+        print(f"  Loading model from {model_path}{'  (lazy, experts stripped)' if has_expert_files else ''}...")
+        self.model, self.tokenizer = load_model(model_path, strip_experts=has_expert_files)
 
         info = get_model_info(self.model)
         print(f"  Model: {info['n_layers']} layers "
