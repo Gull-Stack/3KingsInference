@@ -14,7 +14,6 @@ This approach gives us:
 - Full compatibility with mlx-lm's tokenizer and generation utilities
 """
 
-import types
 from typing import Optional, Any
 
 import mlx.core as mx
@@ -110,8 +109,16 @@ def shard_model(model, machine_id: int, n_machines: int, channel=None):
     inner._odin_machine_id = machine_id
     inner._odin_n_machines = n_machines
 
-    # Monkey-patch the forward pass to use Odin instead of mx.distributed
+    # Monkey-patch the forward pass to use Odin instead of mx.distributed.
+    # We patch the CLASS method and gate on instance attributes, because
+    # mlx nn.Module resolves __call__ via the class, not the instance.
+    _original_forward = type(inner).__call__
+
     def _sharded_forward(self, inputs, cache=None, input_embeddings=None):
+        # Only use Odin path if this instance has been sharded
+        if not hasattr(self, '_odin_channel') or self._odin_channel is None:
+            return _original_forward(self, inputs, cache, input_embeddings)
+
         if input_embeddings is not None:
             hidden_states = input_embeddings
         else:
@@ -121,9 +128,7 @@ def shard_model(model, machine_id: int, n_machines: int, channel=None):
             cache = [None] * self.num_layers
 
         # Machine 1+: receive activations from previous machine
-        if self._odin_machine_id > 0 and self._odin_channel is not None:
-            # Evaluate embeddings first so shapes are known,
-            # then replace with received activations
+        if self._odin_machine_id > 0:
             mx.eval(hidden_states)
             hidden_states = self._odin_channel.recv_activation()
 
@@ -139,7 +144,7 @@ def shard_model(model, machine_id: int, n_machines: int, channel=None):
             hidden_states = layer(hidden_states, mask=mask, cache=cache[i])
 
         # Machine 0 (first): send activations to next machine, recv normed result
-        if self._odin_machine_id < self._odin_n_machines - 1 and self._odin_channel is not None:
+        if self._odin_machine_id < self._odin_n_machines - 1:
             mx.eval(hidden_states)
             self._odin_channel.send_activation(hidden_states)
             # Receive normed result back from last machine — skip local norm
@@ -149,7 +154,7 @@ def shard_model(model, machine_id: int, n_machines: int, channel=None):
         # Last machine (or single machine): apply norm locally
         return self.norm(hidden_states)
 
-    inner.__call__ = types.MethodType(_sharded_forward, inner)
+    type(inner).__call__ = _sharded_forward
 
     # Force eval to materialize only the local layer weights
     mx.eval(model.parameters())
