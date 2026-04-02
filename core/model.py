@@ -14,10 +14,13 @@ This approach gives us:
 - Full compatibility with mlx-lm's tokenizer and generation utilities
 """
 
+import types
 from typing import Optional, Any
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx_lm import load as mlx_load
+from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
 from compression.kv_cache import CompressedKVCache
 
@@ -35,11 +38,6 @@ def load_model(model_path: str, strip_experts: bool = False):
         (model, tokenizer) — the native mlx-lm objects
     """
     if strip_experts:
-        # Lazy load: weights stay as mmap references to safetensors on SSD.
-        # During inference, MLX pages in only the weights needed per forward
-        # pass — non-expert params (~5GB) stay resident, expert weights
-        # (4 of 512 per layer) get paged on demand by the OS page cache.
-        # This IS SSD expert streaming (Mjolnir) via MLX's native mechanism.
         model, tokenizer = mlx_load(model_path, lazy=True)
         print(f"  Lazy loaded — experts will stream from SSD via page cache")
         return model, tokenizer
@@ -55,11 +53,11 @@ def get_model_info(model) -> dict:
     layers = inner.layers
 
     n_layers = len(layers)
-    n_attn = sum(1 for l in layers if not l.is_linear)
-    n_delta = sum(1 for l in layers if l.is_linear)
+    n_attn = sum(1 for l in layers if l is not None and not l.is_linear)
+    n_delta = sum(1 for l in layers if l is not None and l.is_linear)
 
     # Check for MoE
-    has_moe = hasattr(layers[0].mlp, 'gate')
+    has_moe = any(hasattr(l.mlp, 'gate') for l in layers if l is not None)
 
     return {
         "n_layers": n_layers,
@@ -68,6 +66,95 @@ def get_model_info(model) -> dict:
         "has_moe": has_moe,
         "model_type": type(inner).__name__,
     }
+
+
+def shard_model(model, machine_id: int, n_machines: int, channel=None):
+    """Shard the model for pipeline parallelism via Odin TCP channel.
+
+    Replicates what mlx-lm's model.pipeline(group) does, but uses
+    our Odin TCP channel instead of mx.distributed for activation passing.
+
+    Machine 0 (rank 0): processes layers 0..29, has embed_tokens + norm + lm_head
+    Machine 1 (rank 1): processes layers 30..59
+
+    Args:
+        model: The mlx-lm model (Model instance)
+        machine_id: This machine's ID (0 or 1)
+        n_machines: Total machines (2)
+        channel: Odin ActivationChannel for send/recv
+    """
+    inner = model.language_model.model  # Qwen3_5TextModel
+    total_layers = len(inner.layers)
+    layers_per_machine = total_layers // n_machines
+
+    start_idx = machine_id * layers_per_machine
+    end_idx = total_layers if machine_id == n_machines - 1 else (machine_id + 1) * layers_per_machine
+
+    print(f"  Shard: machine {machine_id} gets layers {start_idx}-{end_idx - 1} "
+          f"({end_idx - start_idx} of {total_layers})")
+
+    # Null out non-local layers to free memory
+    for i in range(total_layers):
+        if i < start_idx or i >= end_idx:
+            inner.layers[i] = None
+
+    # Set pipeline indices (same fields mlx-lm's pipeline() sets)
+    inner.start_idx = start_idx
+    inner.end_idx = end_idx
+    inner.num_layers = end_idx - start_idx
+    inner.pipeline_rank = machine_id
+    inner.pipeline_size = n_machines
+
+    # Store channel reference for the patched forward pass
+    inner._odin_channel = channel
+    inner._odin_machine_id = machine_id
+    inner._odin_n_machines = n_machines
+
+    # Monkey-patch the forward pass to use Odin instead of mx.distributed
+    def _sharded_forward(self, inputs, cache=None, input_embeddings=None):
+        if input_embeddings is not None:
+            hidden_states = input_embeddings
+        else:
+            hidden_states = self.embed_tokens(inputs)
+
+        if cache is None:
+            cache = [None] * self.num_layers
+
+        # Machine 1+: receive activations from previous machine
+        if self._odin_machine_id > 0 and self._odin_channel is not None:
+            # Evaluate embeddings first so shapes are known,
+            # then replace with received activations
+            mx.eval(hidden_states)
+            hidden_states = self._odin_channel.recv_activation()
+
+        # Compute masks from first local cache
+        first_cache = cache[0]
+        fa_mask = create_attention_mask(hidden_states, first_cache)
+        ssm_mask = create_ssm_mask(hidden_states, first_cache)
+
+        # Run only local layers
+        for i in range(self.num_layers):
+            layer = self.layers[self.start_idx + i]
+            mask = ssm_mask if layer.is_linear else fa_mask
+            hidden_states = layer(hidden_states, mask=mask, cache=cache[i])
+
+        # Machine 0 (first): send activations to next machine, recv normed result
+        if self._odin_machine_id < self._odin_n_machines - 1 and self._odin_channel is not None:
+            mx.eval(hidden_states)
+            self._odin_channel.send_activation(hidden_states)
+            # Receive normed result back from last machine — skip local norm
+            hidden_states = self._odin_channel.recv_activation()
+            return hidden_states
+
+        # Last machine (or single machine): apply norm locally
+        return self.norm(hidden_states)
+
+    inner.__call__ = types.MethodType(_sharded_forward, inner)
+
+    # Force eval to materialize only the local layer weights
+    mx.eval(model.parameters())
+
+    return start_idx, end_idx
 
 
 def patch_kv_cache(model, key_bits: int = 4, value_bits: int = 5,
@@ -92,6 +179,8 @@ def patch_kv_cache(model, key_bits: int = 4, value_bits: int = 5,
 
     caches = []
     for i, layer in enumerate(layers):
+        if layer is None:
+            continue
         if not layer.is_linear:
             # Full attention layer — use compressed cache
             caches.append(CompressedKVCache(
@@ -149,6 +238,8 @@ def strip_expert_weights(model) -> dict:
     removed = {}
 
     for i, layer in enumerate(inner.layers):
+        if layer is None:
+            continue
         mlp = layer.mlp
         # Check if this is a MoE layer (has switch_mlp)
         if hasattr(mlp, 'switch_mlp'):

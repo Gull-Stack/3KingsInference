@@ -16,7 +16,7 @@ from typing import Optional
 import mlx.core as mx
 
 from core.config import InferenceConfig
-from core.model import load_model, get_model_info, generate_with_compression
+from core.model import load_model, get_model_info, generate_with_compression, shard_model
 from sharding.network import ActivationChannel
 from streaming.expert_loader import ExpertLoader, ExpertConfig
 
@@ -94,6 +94,13 @@ class ThreeKingsPipeline:
             )
             print(f"  Odin: Connecting to peer {peer}...")
             self.channel.connect()
+
+            # Shard the model: null non-local layers, patch forward pass
+            # to use Odin TCP for activation passing instead of mx.distributed
+            shard_model(
+                self.model, self.config.machine_id,
+                self.config.n_machines, self.channel,
+            )
 
         # Mjolnir: expert streaming (only for MoE models)
         if info['has_moe']:

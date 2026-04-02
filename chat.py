@@ -60,12 +60,12 @@ def main():
     pipeline = ThreeKingsPipeline(config)
     pipeline.setup(args.model)
 
-    # Worker mode: stay alive processing activations from peer
+    # Worker mode: process activations from peer in a loop
     if args.worker:
         print("3Kings Worker — processing activations from peer (Ctrl+C to quit)\n")
+        from core.worker import run_worker_loop
         try:
-            import signal
-            signal.pause()
+            run_worker_loop(pipeline)
         except KeyboardInterrupt:
             print("\nWorker shutting down.")
         finally:
