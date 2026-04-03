@@ -16,7 +16,7 @@ from typing import Optional
 import mlx.core as mx
 
 from core.config import InferenceConfig
-from core.model import load_model, get_model_info, generate_with_compression, shard_model
+from core.model import load_model, get_model_info, generate_with_compression, shard_model, patch_selective_expert_loading
 from sharding.network import ActivationChannel
 from streaming.expert_loader import ExpertLoader, ExpertConfig
 
@@ -101,6 +101,17 @@ class ThreeKingsPipeline:
                 self.model, self.config.machine_id,
                 self.config.n_machines, self.channel,
             )
+
+        # Mjolnir: patch MoE to only load active experts (4 of 512)
+        if info['has_moe']:
+            patch_selective_expert_loading()
+
+        # Allow MLX to use full unified memory for expert weight paging.
+        # Expert weights are lazy mmap'd — the OS pages them in/out via SSD.
+        # Without raising this, Metal's wired limit causes OOM when expert
+        # tensors (~1GB each) get touched during the forward pass.
+        mx.set_memory_limit(64 * 1024**3)  # Full 64GB
+        mx.set_cache_limit(256 * 1024**2)  # 256MB GPU cache — small to leave room for page cache
 
         # Mjolnir: expert streaming (only for MoE models)
         if info['has_moe']:

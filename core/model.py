@@ -18,8 +18,10 @@ from typing import Optional, Any
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 from mlx_lm import load as mlx_load
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
 from compression.kv_cache import CompressedKVCache
 
@@ -156,8 +158,43 @@ def shard_model(model, machine_id: int, n_machines: int, channel=None):
 
     type(inner).__call__ = _sharded_forward
 
-    # Force eval to materialize only the local layer weights
-    mx.eval(model.parameters())
+    # Eval non-expert parameters only. Expert weights stay as lazy mmap
+    # references — the selective loading patch ensures only active experts
+    # (4 of 512) are paged in during inference.
+    non_expert_params = []
+    for i in range(start_idx, end_idx):
+        layer = inner.layers[i]
+        if layer is None:
+            continue
+        # Collect attention/norm params (not MoE expert projections)
+        if hasattr(layer, 'self_attn'):
+            non_expert_params.extend(tree_flatten(layer.self_attn.parameters()))
+        if hasattr(layer, 'linear_attn'):
+            non_expert_params.extend(tree_flatten(layer.linear_attn.parameters()))
+        if hasattr(layer, 'input_layernorm'):
+            non_expert_params.extend(tree_flatten(layer.input_layernorm.parameters()))
+        if hasattr(layer, 'post_attention_layernorm'):
+            non_expert_params.extend(tree_flatten(layer.post_attention_layernorm.parameters()))
+        # MoE: only eval gate, shared_expert, shared_expert_gate (NOT switch_mlp)
+        mlp = layer.mlp
+        if hasattr(mlp, 'gate'):
+            non_expert_params.extend(tree_flatten(mlp.gate.parameters()))
+        if hasattr(mlp, 'shared_expert'):
+            non_expert_params.extend(tree_flatten(mlp.shared_expert.parameters()))
+        if hasattr(mlp, 'shared_expert_gate'):
+            non_expert_params.extend(tree_flatten(mlp.shared_expert_gate.parameters()))
+
+    # Also eval embed_tokens, norm, lm_head
+    lm = model.language_model
+    non_expert_params.extend(tree_flatten(inner.embed_tokens.parameters()))
+    non_expert_params.extend(tree_flatten(inner.norm.parameters()))
+    if hasattr(lm, 'lm_head'):
+        non_expert_params.extend(tree_flatten(lm.lm_head.parameters()))
+
+    # tree_flatten returns (key, value) tuples — extract just the arrays
+    arrays = [v for _, v in non_expert_params if isinstance(v, mx.array)]
+    if arrays:
+        mx.eval(*arrays)
 
     return start_idx, end_idx
 
@@ -260,3 +297,68 @@ def strip_expert_weights(model) -> dict:
                         proj.weight = mx.zeros((1,), dtype=mx.float32)
 
     return removed
+
+
+def patch_selective_expert_loading():
+    """Monkey-patch QuantizedSwitchLinear to only load active experts.
+
+    The default gather_qmm accesses the FULL weight tensor (all 512 experts),
+    which causes Metal to page in ~3.5GB per projection per layer from mmap.
+    On 64GB machines this OOMs.
+
+    This patch slices only the active experts (typically 4) from the weight
+    tensor BEFORE calling gather_qmm, reducing memory access from ~3.5GB
+    to ~28MB per projection. The sliced experts get sequential indices 0..k-1,
+    so we remap the original expert indices accordingly.
+    """
+    import numpy as np
+
+    def _selective_call(self, x, indices, sorted_indices=False):
+        n_experts = self.weight.shape[0]
+
+        # Extract unique expert indices using numpy (small array, fast)
+        flat_np = np.array(indices.flatten().tolist(), dtype=np.int32)
+        unique_np = np.unique(flat_np)
+
+        # Slice active experts one at a time via contiguous indexing.
+        # MLX mmap reads the full backing tensor on any access, so we
+        # load each expert's slice individually and stack them to avoid
+        # materializing the full 512-expert tensor (~1GB per projection).
+        w_slices = [self["weight"][int(e):int(e)+1] for e in unique_np]
+        s_slices = [self["scales"][int(e):int(e)+1] for e in unique_np]
+        w = mx.concatenate(w_slices, axis=0)
+        s = mx.concatenate(s_slices, axis=0)
+        b = self.get("biases")
+        if b is not None:
+            b_slices = [b[int(e):int(e)+1] for e in unique_np]
+            b = mx.concatenate(b_slices, axis=0)
+
+        # Eval the small sliced tensors to free mmap pressure
+        if b is not None:
+            mx.eval(w, s, b)
+        else:
+            mx.eval(w, s)
+
+        # Remap indices: original expert_id -> position in sliced tensor
+        remap_np = np.zeros(n_experts, dtype=np.int32)
+        for i, e in enumerate(unique_np):
+            remap_np[e] = i
+        new_flat = remap_np[flat_np]
+        new_indices = mx.array(new_flat.reshape(indices.shape), dtype=indices.dtype)
+
+        # Call gather_qmm on the small sliced tensors
+        x = mx.gather_qmm(
+            x, w, s, b,
+            rhs_indices=new_indices,
+            transpose=True,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+            sorted_indices=False,
+        )
+        if "bias" in self:
+            x = x + mx.expand_dims(self["bias"][indices], -2)
+        return x
+
+    QuantizedSwitchLinear.__call__ = _selective_call
+    print("  Mjolnir: Patched MoE for selective expert loading (4 of 512 per token)")
