@@ -68,6 +68,9 @@ class ActivationChannel:
             raise RuntimeError("Not connected. Call connect() first.")
 
         # Convert to numpy for serialization
+        # MLX bfloat16 can't convert directly to numpy — cast to float32 first
+        if tensor.dtype == mx.bfloat16:
+            tensor = tensor.astype(mx.float32)
         data = np.array(tensor, dtype=np.float32)
         shape = data.shape
 
