@@ -106,12 +106,8 @@ class ThreeKingsPipeline:
         if info['has_moe']:
             patch_selective_expert_loading()
 
-        # Allow MLX to use full unified memory for expert weight paging.
-        # Expert weights are lazy mmap'd — the OS pages them in/out via SSD.
-        # Without raising this, Metal's wired limit causes OOM when expert
-        # tensors (~1GB each) get touched during the forward pass.
-        mx.set_memory_limit(64 * 1024**3)  # Full 64GB
-        mx.set_cache_limit(256 * 1024**2)  # 256MB GPU cache — small to leave room for page cache
+        # Keep GPU cache small to leave room for page cache
+        mx.set_cache_limit(256 * 1024**2)  # 256MB
 
         # Mjolnir: expert streaming (only for MoE models)
         if info['has_moe']:
